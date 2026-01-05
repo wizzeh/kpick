@@ -1,17 +1,48 @@
+mod config;
 mod keepassxc;
 
+use config::Config;
 use keepassxc::KeePassXCClient;
 
 fn main() {
     println!("kpick - KeePassXC password picker");
 
-    match KeePassXCClient::connect() {
-        Ok(client) => {
-            println!("Connected to KeePassXC! Client ID: {}", client.client_id());
-        }
+    let mut config = Config::load().expect("Failed to load config");
+
+    let mut client = match KeePassXCClient::connect() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
+        }
+    };
+
+    // Check if we have an existing association
+    if let Some(ref assoc) = config.association {
+        match client.test_associate(&assoc.id, &assoc.id_key) {
+            Ok(true) => {
+                println!("Association valid: {}", assoc.id);
+            }
+            Ok(false) | Err(_) => {
+                println!("Association invalid, need to re-associate");
+                config.association = None;
+            }
+        }
+    }
+
+    // Associate if needed
+    if config.association.is_none() {
+        println!("Associating with KeePassXC (check KeePassXC for prompt)...");
+        match client.associate() {
+            Ok((id, id_key)) => {
+                println!("Associated as: {}", id);
+                config.association = Some(config::Association { id, id_key });
+                config.save().expect("Failed to save config");
+            }
+            Err(e) => {
+                eprintln!("Association failed: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
