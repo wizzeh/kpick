@@ -1,7 +1,9 @@
+mod clipboard;
 mod config;
 mod keepassxc;
 mod search;
 
+use clipboard::copy_with_clear;
 use config::Config;
 use keepassxc::KeePassXCClient;
 use search::{FrecencyData, Searcher};
@@ -19,7 +21,7 @@ fn main() {
         }
     };
 
-    // Check/create association (same as before)
+    // Check/create association
     if let Some(ref assoc) = config.association {
         if !client.test_associate(&assoc.id, &assoc.id_key).unwrap_or(false) {
             config.association = None;
@@ -39,18 +41,26 @@ fn main() {
         .get_logins(&assoc.id, &assoc.id_key)
         .expect("Failed to get logins");
 
-    // Test search
+    // Search
     let frecency = FrecencyData::default();
     let mut searcher = Searcher::new();
 
     let query = std::env::args().nth(1).unwrap_or_default();
     let results = searcher.search(&query, &entries, &frecency);
 
-    println!("\nSearch results for '{}':", query);
-    for result in results.iter().take(10) {
-        println!(
-            "  [{}] {} - {}",
-            result.score, result.entry.name, result.entry.login
-        );
+    if results.is_empty() {
+        println!("No matching entries found");
+        return;
     }
+
+    // For now, just copy the first result
+    let selected = &results[0];
+    println!("Copying password for: {} - {}", selected.entry.name, selected.entry.login);
+
+    if let Err(e) = copy_with_clear(&selected.entry.password, 10) {
+        eprintln!("Failed to copy to clipboard: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("Password copied! (will clear in 10 seconds)");
 }
