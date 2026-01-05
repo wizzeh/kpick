@@ -1,0 +1,27 @@
+[package]
+name = "kpick"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# UI
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop"] }
+egui = "0.29"
+tiny-skia = "0.11"
+softbuffer = "0.4"
+
+# KeePassXC protocol
+crypto_box = "0.9"
+rand = "0.8"
+base64 = "0.22"
+
+# Core
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+nucleo-matcher = "0.3"
+arboard = { version = "3.4", features = ["wayland-data-control"] }
+directories = "5.0"
+thiserror = "2.0"
+
+# Async/runtime
+calloop = "0.14"
