@@ -1,8 +1,10 @@
 mod config;
 mod keepassxc;
+mod search;
 
 use config::Config;
 use keepassxc::KeePassXCClient;
+use search::{FrecencyData, Searcher};
 
 fn main() {
     println!("kpick - KeePassXC password picker");
@@ -17,50 +19,38 @@ fn main() {
         }
     };
 
-    // Check if we have an existing association
+    // Check/create association (same as before)
     if let Some(ref assoc) = config.association {
-        match client.test_associate(&assoc.id, &assoc.id_key) {
-            Ok(true) => {
-                println!("Association valid: {}", assoc.id);
-            }
-            Ok(false) | Err(_) => {
-                println!("Association invalid, need to re-associate");
-                config.association = None;
-            }
+        if !client.test_associate(&assoc.id, &assoc.id_key).unwrap_or(false) {
+            config.association = None;
         }
     }
 
-    // Associate if needed
     if config.association.is_none() {
         println!("Associating with KeePassXC (check KeePassXC for prompt)...");
-        match client.associate() {
-            Ok((id, id_key)) => {
-                println!("Associated as: {}", id);
-                config.association = Some(config::Association { id, id_key });
-                config.save().expect("Failed to save config");
-            }
-            Err(e) => {
-                eprintln!("Association failed: {}", e);
-                std::process::exit(1);
-            }
-        }
+        let (id, id_key) = client.associate().expect("Association failed");
+        config.association = Some(config::Association { id, id_key });
+        config.save().expect("Failed to save config");
     }
 
     // Fetch entries
     let assoc = config.association.as_ref().unwrap();
-    match client.get_logins(&assoc.id, &assoc.id_key) {
-        Ok(entries) => {
-            println!("\nFound {} entries:", entries.len());
-            for entry in entries.iter().take(10) {
-                println!("  {} - {}", entry.name, entry.login);
-            }
-            if entries.len() > 10 {
-                println!("  ... and {} more", entries.len() - 10);
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to get logins: {}", e);
-            std::process::exit(1);
-        }
+    let entries = client
+        .get_logins(&assoc.id, &assoc.id_key)
+        .expect("Failed to get logins");
+
+    // Test search
+    let frecency = FrecencyData::default();
+    let mut searcher = Searcher::new();
+
+    let query = std::env::args().nth(1).unwrap_or_default();
+    let results = searcher.search(&query, &entries, &frecency);
+
+    println!("\nSearch results for '{}':", query);
+    for result in results.iter().take(10) {
+        println!(
+            "  [{}] {} - {}",
+            result.score, result.entry.name, result.entry.login
+        );
     }
 }
