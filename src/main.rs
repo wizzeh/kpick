@@ -45,4 +45,22 @@ fn main() {
             }
         }
     }
+
+    // Fetch entries
+    let assoc = config.association.as_ref().unwrap();
+    match client.get_logins(&assoc.id, &assoc.id_key) {
+        Ok(entries) => {
+            println!("\nFound {} entries:", entries.len());
+            for entry in entries.iter().take(10) {
+                println!("  {} - {}", entry.name, entry.login);
+            }
+            if entries.len() > 10 {
+                println!("  ... and {} more", entries.len() - 10);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to get logins: {}", e);
+            std::process::exit(1);
+        }
+    }
 }

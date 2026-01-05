@@ -212,4 +212,29 @@ impl KeePassXCClient {
         let response: TestAssociateResponse = self.send_encrypted("test-associate", &request)?;
         Ok(response.success.as_deref() == Some("true"))
     }
+
+    /// Get all login entries from KeePassXC
+    pub fn get_logins(&mut self, id: &str, id_key: &str) -> Result<Vec<LoginEntry>, ClientError> {
+        let request = GetLoginsRequest {
+            action: "get-logins".to_string(),
+            url: "kpick://all".to_string(), // Special URL to get all entries
+            keys: vec![DatabaseKey {
+                id: id.to_string(),
+                key: id_key.to_string(),
+            }],
+        };
+
+        let response: GetLoginsResponse = self.send_encrypted("get-logins", &request)?;
+
+        if response.success.as_deref() != Some("true") {
+            if let Some(error) = response.error {
+                if error.contains("locked") {
+                    return Err(ClientError::DatabaseLocked);
+                }
+                return Err(ClientError::Protocol(error));
+            }
+        }
+
+        Ok(response.entries)
+    }
 }
