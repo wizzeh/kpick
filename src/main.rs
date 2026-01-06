@@ -1,6 +1,7 @@
 mod clipboard;
 mod config;
 mod database;
+mod frecency;
 mod search;
 mod ui;
 
@@ -11,13 +12,15 @@ use std::rc::Rc;
 use clipboard::copy_with_clear;
 use config::Config;
 use database::Entry;
+use frecency::FrecencyData;
 use search::Searcher;
 use ui::{AppState, Mode};
 use wayland_client::Connection;
 
 fn main() {
-    // 1. Load config
+    // 1. Load config and frecency data
     let config = Rc::new(RefCell::new(Config::load().expect("Failed to load config")));
+    let frecency = Rc::new(RefCell::new(FrecencyData::load()));
 
     // 2. Database path (for now, use test.kdbx in current directory)
     let db_path = PathBuf::from("test.kdbx");
@@ -92,9 +95,8 @@ fn main() {
             let is_picker_mode = app_state.mode == Mode::Picker;
             if is_picker_mode && was_password_mode {
                 // Initialize entries list after unlock
-                let frecency = &config.borrow().frecency;
                 let mut search = searcher.borrow_mut();
-                let results = search.search("", &entries.borrow(), frecency);
+                let results = search.search("", &entries.borrow(), &frecency.borrow());
                 let display_entries: Vec<(String, String)> = results
                     .iter()
                     .map(|r| (r.entry.title.clone(), r.entry.username.clone()))
@@ -107,9 +109,8 @@ fn main() {
             // In picker mode, update entries when query changes
             if is_picker_mode && app_state.query != last_query {
                 last_query = app_state.query.clone();
-                let frecency = &config.borrow().frecency;
                 let mut search = searcher.borrow_mut();
-                let results = search.search(&last_query, &entries.borrow(), frecency);
+                let results = search.search(&last_query, &entries.borrow(), &frecency.borrow());
                 let display_entries: Vec<(String, String)> = results
                     .iter()
                     .map(|r| (r.entry.title.clone(), r.entry.username.clone()))
@@ -137,9 +138,9 @@ fn main() {
     if let Some(entry) = final_entry {
         // Update frecency
         {
-            let mut cfg = config.borrow_mut();
-            cfg.frecency.record_use(&entry.uuid);
-            if let Err(e) = cfg.save() {
+            let mut frec = frecency.borrow_mut();
+            frec.record_use(&entry.uuid);
+            if let Err(e) = frec.save() {
                 eprintln!("Warning: Failed to save frecency data: {}", e);
             }
         }
