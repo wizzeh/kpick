@@ -111,8 +111,12 @@ pub struct AppState {
     pub selected_index: usize,
     pub entries: Vec<(String, String)>,
 
+    // Keyboard modifier state
+    modifiers: Modifiers,
+
     // Callbacks for when user makes a selection
-    pub on_select: Option<Box<dyn FnMut(usize)>>,
+    // Parameters: (index, copy_username) - if copy_username is true, copy username instead of password
+    pub on_select: Option<Box<dyn FnMut(usize, bool)>>,
     pub on_escape: Option<Box<dyn FnMut()>>,
     pub on_query_change: Option<Box<dyn FnMut(&str)>>,
     pub on_unlock: Option<Box<dyn FnMut(Vec<Entry>)>>,
@@ -183,6 +187,7 @@ impl AppState {
             query: String::new(),
             selected_index: 0,
             entries: Vec::new(),
+            modifiers: Modifiers::default(),
             on_select: None,
             on_escape: None,
             on_query_change: None,
@@ -459,9 +464,10 @@ impl KeyboardHandler for AppState {
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
-        _modifiers: Modifiers,
+        modifiers: Modifiers,
         _layout: u32,
     ) {
+        self.modifiers = modifiers;
     }
 }
 
@@ -691,7 +697,9 @@ impl AppState {
             }
             Keysym::Return | Keysym::KP_Enter => {
                 if let Some(ref mut cb) = self.on_select {
-                    cb(self.selected_index);
+                    // Shift+Enter copies username instead of password
+                    let copy_username = self.modifiers.shift;
+                    cb(self.selected_index, copy_username);
                 }
                 self.running = false;
             }

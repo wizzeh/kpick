@@ -40,6 +40,8 @@ fn main() {
 
     // Selected entry tracking - only set when user confirms with Enter
     let selected_entry: Rc<RefCell<Option<Entry>>> = Rc::new(RefCell::new(None));
+    // Track whether to copy username (Shift+Enter) instead of password
+    let copy_username: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     // 4. Set callbacks
 
@@ -60,10 +62,12 @@ fn main() {
     {
         let selected_entry = selected_entry.clone();
         let current_results = current_results.clone();
-        app_state.on_select = Some(Box::new(move |index| {
+        let copy_username = copy_username.clone();
+        app_state.on_select = Some(Box::new(move |index, should_copy_username| {
             let results = current_results.borrow();
             if index < results.len() {
                 *selected_entry.borrow_mut() = Some(results[index].clone());
+                *copy_username.borrow_mut() = should_copy_username;
             }
         }));
     }
@@ -127,8 +131,9 @@ fn main() {
         }
     }
 
-    // 6. On selection: copy password, update frecency, exit
+    // 6. On selection: copy password or username, update frecency, exit
     let final_entry = selected_entry.borrow().clone();
+    let should_copy_username = *copy_username.borrow();
     if let Some(entry) = final_entry {
         // Update frecency
         {
@@ -139,12 +144,18 @@ fn main() {
             }
         }
 
-        // Copy password to clipboard
-        if let Err(e) = copy_with_clear(&entry.password, 10) {
+        // Copy password or username to clipboard
+        let (value, label) = if should_copy_username {
+            (&entry.username, "Username")
+        } else {
+            (&entry.password, "Password")
+        };
+
+        if let Err(e) = copy_with_clear(value, 10) {
             eprintln!("Failed to copy to clipboard: {}", e);
             std::process::exit(1);
         }
 
-        eprintln!("Password copied for: {} - {} (clears in 10s)", entry.title, entry.username);
+        eprintln!("{} copied for: {} - {} (clears in 10s)", label, entry.title, entry.username);
     }
 }
