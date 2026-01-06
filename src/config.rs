@@ -218,6 +218,7 @@ impl Config {
         Ok(toml::from_str(&contents)?)
     }
 
+    #[allow(dead_code)]
     pub fn save(&self) -> Result<(), ConfigError> {
         let path = Self::config_path()?;
         if let Some(parent) = path.parent() {
