@@ -22,8 +22,12 @@ fn main() {
     let config = Rc::new(RefCell::new(Config::load().expect("Failed to load config")));
     let frecency = Rc::new(RefCell::new(FrecencyData::load()));
 
-    // 2. Database path (for now, use test.kdbx in current directory)
-    let db_path = PathBuf::from("test.kdbx");
+    // 2. Get database path from config, fall back to test.kdbx
+    let db_path = config.borrow().expand_database_path()
+        .unwrap_or_else(|| PathBuf::from("test.kdbx"));
+
+    // Store clipboard timeout before the event loop
+    let clipboard_timeout = config.borrow().clipboard_timeout;
 
     // Check database exists before launching UI
     if !db_path.exists() {
@@ -151,11 +155,15 @@ fn main() {
             (&entry.password, "Password")
         };
 
-        if let Err(e) = copy_with_clear(value, 10) {
+        if let Err(e) = copy_with_clear(value, clipboard_timeout) {
             eprintln!("Failed to copy to clipboard: {}", e);
             std::process::exit(1);
         }
 
-        eprintln!("{} copied for: {} - {} (clears in 10s)", label, entry.title, entry.username);
+        if clipboard_timeout > 0 {
+            eprintln!("{} copied for: {} - {} (clears in {}s)", label, entry.title, entry.username, clipboard_timeout);
+        } else {
+            eprintln!("{} copied for: {} - {}", label, entry.title, entry.username);
+        }
     }
 }
