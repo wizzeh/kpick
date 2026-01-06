@@ -33,8 +33,7 @@ fn main() {
 
     // 3. Set up UI - starts in password mode
     let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
-    let colors = config.borrow().colors.to_rgb();
-    let (mut app_state, mut event_queue) = AppState::new(&conn, colors, db_path);
+    let (mut app_state, mut event_queue) = AppState::new(&conn, &config.borrow(), db_path);
 
     // Shared state for entries and search
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));

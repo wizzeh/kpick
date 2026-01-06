@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::ColorSchemeRgb;
+use crate::config::{ColorSchemeRgb, Config, PasswordWindowConfig, PickerWindowConfig};
 use crate::database::{open_database, Entry};
 
 /// UI mode - password entry or entry picker
@@ -176,11 +176,19 @@ pub struct AppState {
     // Screen dimensions for resizing
     screen_width: u32,
     screen_height: u32,
+
+    // Config values
+    flash_duration_ms: u64,
+    font_size: f32,
+    hints_font_size: f32,
+    password_window: PasswordWindowConfig,
+    picker_window: PickerWindowConfig,
+    max_entries: usize,
 }
 
 impl AppState {
     /// Create a new AppState and its associated event queue
-    pub fn new(conn: &Connection, colors: ColorSchemeRgb, db_path: PathBuf) -> (Self, EventQueue<Self>) {
+    pub fn new(conn: &Connection, config: &Config, db_path: PathBuf) -> (Self, EventQueue<Self>) {
         let (globals, event_queue) = registry_queue_init::<Self>(conn).unwrap();
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
@@ -192,7 +200,10 @@ impl AppState {
         let output_state = OutputState::new(&globals, &qh);
 
         // Load our font for text rendering
-        let font = load_font_by_family("DejaVu Sans");
+        let font = load_font_by_family(&config.font.family);
+
+        // Convert colors to RGB
+        let colors = config.colors.to_rgb();
 
         // Create our surface
         let surface = compositor.create_surface(&qh);
@@ -240,6 +251,12 @@ impl AppState {
             sized_to_output: false,
             screen_width: 0,
             screen_height: 0,
+            flash_duration_ms: config.flash_duration,
+            font_size: config.font.size,
+            hints_font_size: config.font.hints_size,
+            password_window: config.window.password.clone(),
+            picker_window: config.window.picker.clone(),
+            max_entries: config.window.picker.max_entries,
         };
 
         (state, event_queue)
@@ -636,14 +653,12 @@ impl AppState {
     fn size_for_mode(&self) -> (u32, u32) {
         match self.mode {
             Mode::Password => {
-                // Password mode: compact size
-                // Content height: label (32) + padding (8) + input (40) + error space (40) + hints (20) + padding (32)
-                let content_height = 172u32;
-                let content_width = 400u32;
+                let content_width = self.password_window.width;
+                let content_height = self.password_window.height;
+                let max_percent = self.password_window.max_percent;
 
-                // Use content size, but cap at 40% of screen
-                let max_width = self.screen_width * 2 / 5;
-                let max_height = self.screen_height * 2 / 5;
+                let max_width = self.screen_width * max_percent / 100;
+                let max_height = self.screen_height * max_percent / 100;
 
                 let width = content_width.min(max_width).max(300);
                 let height = content_height.min(max_height).max(150);
@@ -651,9 +666,8 @@ impl AppState {
                 (width, height)
             }
             Mode::Picker => {
-                // Picker mode: 50% width, 40% height
-                let width = self.screen_width / 2;
-                let height = self.screen_height * 2 / 5;
+                let width = self.screen_width * self.picker_window.width_percent / 100;
+                let height = self.screen_height * self.picker_window.height_percent / 100;
                 (width.max(400), height.max(200))
             }
         }
@@ -842,13 +856,13 @@ impl AppState {
             pixel[3] = 255; // A
         }
 
-        const FLASH_DURATION: Duration = Duration::from_millis(150);
+        let flash_duration = Duration::from_millis(self.flash_duration_ms);
 
         match self.mode {
             Mode::Password => {
                 // Check if we're within the flash window
                 let flash_active = self.last_keypress
-                    .map(|t| t.elapsed() < FLASH_DURATION)
+                    .map(|t| t.elapsed() < flash_duration)
                     .unwrap_or(false);
 
                 draw_password_mode(
@@ -860,6 +874,8 @@ impl AppState {
                     self.password.is_empty(),
                     self.password_error.as_deref(),
                     flash_active,
+                    self.font_size,
+                    self.hints_font_size,
                 );
 
                 // Keep redrawing while flash is active
@@ -876,6 +892,9 @@ impl AppState {
                 &self.query,
                 &self.entries,
                 self.selected_index,
+                self.font_size,
+                self.hints_font_size,
+                self.max_entries,
             ),
         }
 
@@ -903,8 +922,9 @@ fn draw_password_mode(
     password_is_empty: bool,
     password_error: Option<&str>,
     flash: bool,
+    font_size: f32,
+    hints_font_size: f32,
 ) {
-    const FONT_SIZE: f32 = 18.0;
     const PADDING: usize = 16;
     const INPUT_HEIGHT: usize = 40;
     const LABEL_HEIGHT: usize = 32;
@@ -923,7 +943,7 @@ fn draw_password_mode(
         PADDING + 8,
         start_y,
         LABEL_HEIGHT,
-        FONT_SIZE,
+        font_size,
         colors.foreground,
     );
 
@@ -953,7 +973,7 @@ fn draw_password_mode(
             PADDING + 8,
             input_y,
             INPUT_HEIGHT,
-            FONT_SIZE,
+            font_size,
             colors.foreground_subtle,
         );
     }
@@ -988,14 +1008,13 @@ fn draw_password_mode(
             PADDING + 8,
             error_y,
             LABEL_HEIGHT,
-            FONT_SIZE,
+            font_size,
             colors.error,
         );
     }
 
     // Draw keyboard hints at bottom
     const HINTS_HEIGHT: usize = 20;
-    const HINTS_FONT_SIZE: f32 = 14.0;
     let hints = "Enter: unlock | Esc: cancel";
     let hints_y = height - PADDING - HINTS_HEIGHT;
     draw_text_centered(
@@ -1007,7 +1026,7 @@ fn draw_password_mode(
         PADDING,
         hints_y,
         HINTS_HEIGHT,
-        HINTS_FONT_SIZE,
+        hints_font_size,
         colors.foreground_subtle,
     );
 }
@@ -1021,9 +1040,11 @@ fn draw_picker_mode(
     query: &str,
     entries: &[(String, String)],
     selected_index: usize,
+    font_size: f32,
+    hints_font_size: f32,
+    max_entries: usize,
 ) {
     // Constants for layout
-    const FONT_SIZE: f32 = 18.0;
     const PADDING: usize = 16;
     const INPUT_HEIGHT: usize = 40;
     const ENTRY_HEIGHT: usize = 32;
@@ -1062,13 +1083,13 @@ fn draw_picker_mode(
         PADDING + 8,
         PADDING,
         INPUT_HEIGHT,
-        FONT_SIZE,
+        font_size,
         text_color,
     );
 
     // Draw entries list
     let entries_start_y = PADDING + INPUT_HEIGHT + PADDING;
-    let max_visible = ((height - entries_start_y - 40) / ENTRY_HEIGHT).min(10);
+    let max_visible = ((height - entries_start_y - 40) / ENTRY_HEIGHT).min(max_entries);
 
     if entries.is_empty() && !query.is_empty() {
         // Show "No matches" when search returns no results
@@ -1081,7 +1102,7 @@ fn draw_picker_mode(
             PADDING + 8,
             entries_start_y,
             ENTRY_HEIGHT,
-            FONT_SIZE,
+            font_size,
             colors.foreground_subtle,
         );
     } else {
@@ -1120,7 +1141,7 @@ fn draw_picker_mode(
                 PADDING + 8,
                 y,
                 ENTRY_HEIGHT,
-                FONT_SIZE,
+                font_size,
                 color,
             );
         }
@@ -1128,7 +1149,6 @@ fn draw_picker_mode(
 
     // Draw keyboard hints at bottom
     const HINTS_HEIGHT: usize = 20;
-    const HINTS_FONT_SIZE: f32 = 14.0;
     let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
     let hints_y = height - PADDING - HINTS_HEIGHT;
     draw_text_centered(
@@ -1140,7 +1160,7 @@ fn draw_picker_mode(
         PADDING,
         hints_y,
         HINTS_HEIGHT,
-        HINTS_FONT_SIZE,
+        hints_font_size,
         colors.foreground_subtle,
     );
 }
