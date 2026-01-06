@@ -1,4 +1,7 @@
 use fontdue::{Font, FontSettings};
+
+use crate::config::ColorSchemeRgb;
+
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
@@ -81,6 +84,9 @@ pub struct AppState {
     // Font for text rendering
     font: Font,
 
+    // Color scheme
+    colors: ColorSchemeRgb,
+
     // Input state
     pub query: String,
     pub selected_index: usize,
@@ -92,11 +98,17 @@ pub struct AppState {
     pub on_select: Option<Box<dyn FnMut(usize)>>,
     pub on_escape: Option<Box<dyn FnMut()>>,
     pub on_query_change: Option<Box<dyn FnMut(&str)>>,
+
+    // Track if we need to redraw
+    needs_redraw: bool,
+
+    // Track if we've sized to the output yet
+    sized_to_output: bool,
 }
 
 impl AppState {
     /// Create a new AppState and its associated event queue
-    pub fn new(conn: &Connection) -> (Self, EventQueue<Self>) {
+    pub fn new(conn: &Connection, colors: ColorSchemeRgb) -> (Self, EventQueue<Self>) {
         let (globals, event_queue) = registry_queue_init::<Self>(conn).unwrap();
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
@@ -113,25 +125,19 @@ impl AppState {
         // Create our surface
         let surface = compositor.create_surface(&qh);
 
-        // Create layer surface
-        let layer_surface = layer_shell.create_layer_surface(
-            &qh,
-            surface,
-            Layer::Overlay,
-            Some("kpick"),
-            None,
-        );
+        // Create layer surface with temporary size (will resize after roundtrip)
+        let layer_surface =
+            layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("kpick"), None);
 
-        // Configure layer surface
-        layer_surface.set_anchor(Anchor::TOP);
-        layer_surface.set_size(600, 400);
+        // Configure layer surface - no anchor means centered
+        layer_surface.set_anchor(Anchor::empty());
+        layer_surface.set_size(800, 400); // Temporary
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-        layer_surface.set_margin(100, 0, 0, 0); // 100px from top
         layer_surface.commit();
 
         let state = Self {
             running: true,
-            width: 600,
+            width: 800,
             height: 400,
             registry_state,
             seat_state,
@@ -143,12 +149,15 @@ impl AppState {
             keyboard: None,
             pointer: None,
             font,
+            colors,
             query: String::new(),
             selected_index: 0,
             entries: Vec::new(),
             on_select: None,
             on_escape: None,
             on_query_change: None,
+            needs_redraw: true,
+            sized_to_output: false,
         };
 
         (state, event_queue)
@@ -174,6 +183,13 @@ impl AppState {
     /// Update the list of entries to display
     pub fn set_entries(&mut self, entries: Vec<(String, String)>) {
         self.entries = entries;
+        self.needs_redraw = true;
+    }
+
+    /// Mark that we need to redraw
+    #[allow(dead_code)]
+    pub fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
     }
 }
 
@@ -211,8 +227,34 @@ impl CompositorHandler for AppState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        // Only resize once when we first enter an output
+        if self.sized_to_output {
+            return;
+        }
+        self.sized_to_output = true;
+
+        // Get the output dimensions
+        if let Some(info) = self.output_state.info(output) {
+            if let Some((screen_width, screen_height)) = info.logical_size {
+                // Calculate window size: 50% width, 40% height
+                let width = screen_width as u32 / 2;
+                let height = screen_height as u32 * 2 / 5;
+
+                self.width = width;
+                self.height = height;
+
+                if let Some(ref layer) = self.layer_surface {
+                    layer.set_size(width, height);
+                    layer.commit();
+                }
+
+                // Need to recreate the buffer pool for new size
+                self.pool = None;
+                self.needs_redraw = true;
+            }
+        }
     }
 
     fn surface_leave(
@@ -284,6 +326,7 @@ impl LayerShellHandler for AppState {
         }
 
         // Initial draw - clone layer to avoid borrow issues
+        self.needs_redraw = true;
         let layer_clone = layer.clone();
         self.draw(qh, &layer_clone);
     }
@@ -371,16 +414,23 @@ impl KeyboardHandler for AppState {
             Keysym::Up => {
                 if self.selected_index > 0 {
                     self.selected_index -= 1;
+                    self.needs_redraw = true;
                 }
             }
             Keysym::Down => {
-                self.selected_index += 1;
+                if self.selected_index + 1 < self.entries.len() {
+                    self.selected_index += 1;
+                    self.needs_redraw = true;
+                }
             }
             Keysym::BackSpace => {
-                self.query.pop();
-                self.selected_index = 0;
-                if let Some(ref mut cb) = self.on_query_change {
-                    cb(&self.query);
+                if !self.query.is_empty() {
+                    self.query.pop();
+                    self.selected_index = 0;
+                    self.needs_redraw = true;
+                    if let Some(ref mut cb) = self.on_query_change {
+                        cb(&self.query);
+                    }
                 }
             }
             _ => {
@@ -389,6 +439,7 @@ impl KeyboardHandler for AppState {
                     if c.is_ascii_graphic() || c == ' ' {
                         self.query.push(c);
                         self.selected_index = 0;
+                        self.needs_redraw = true;
                         if let Some(ref mut cb) = self.on_query_change {
                             cb(&self.query);
                         }
@@ -446,12 +497,22 @@ impl ProvidesRegistryState for AppState {
 }
 
 /// Fill a rectangle with a solid color (free function to avoid borrow issues)
-fn fill_rect(canvas: &mut [u8], stride: usize, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+fn fill_rect(
+    canvas: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    r: u8,
+    g: u8,
+    b: u8,
+) {
     for row in y..(y + h) {
         for col in x..(x + w) {
             let idx = (row * stride + col) * 4;
             if idx + 3 < canvas.len() {
-                canvas[idx] = b;     // B
+                canvas[idx] = b; // B
                 canvas[idx + 1] = g; // G
                 canvas[idx + 2] = r; // R
                 canvas[idx + 3] = 255; // A
@@ -460,17 +521,41 @@ fn fill_rect(canvas: &mut [u8], stride: usize, x: usize, y: usize, w: usize, h: 
     }
 }
 
-/// Draw text at position using fontdue (free function to avoid borrow issues)
-fn draw_text(font: &Font, canvas: &mut [u8], stride: usize, canvas_height: usize, text: &str, x: usize, y: usize, size: f32, color: (u8, u8, u8)) {
+/// Draw text vertically centered in a row
+/// `y` is the top of the row, `row_height` is the height to center within
+fn draw_text_centered(
+    font: &Font,
+    canvas: &mut [u8],
+    stride: usize,
+    canvas_height: usize,
+    text: &str,
+    x: usize,
+    y: usize,
+    row_height: usize,
+    size: f32,
+    color: (u8, u8, u8),
+) {
     let mut cursor_x = x as i32;
     let (r, g, b) = color;
+
+    // Get font metrics for vertical centering
+    let line_metrics = font.horizontal_line_metrics(size);
+    let text_height = if let Some(m) = line_metrics {
+        (m.ascent - m.descent) as i32
+    } else {
+        size as i32
+    };
+
+    // Calculate baseline y for vertical centering
+    let ascent = line_metrics.map(|m| m.ascent as i32).unwrap_or(size as i32);
+    let baseline_y = y as i32 + (row_height as i32 - text_height) / 2 + ascent;
 
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, size);
 
-        // Calculate glyph position
+        // Position glyph relative to baseline
         let glyph_x = cursor_x + metrics.xmin;
-        let glyph_y = y as i32 + (size as i32 - metrics.height as i32 - metrics.ymin);
+        let glyph_y = baseline_y - metrics.height as i32 - metrics.ymin;
 
         // Copy glyph bitmap to canvas
         for row in 0..metrics.height {
@@ -504,8 +589,13 @@ fn draw_text(font: &Font, canvas: &mut [u8], stride: usize, canvas_height: usize
 }
 
 impl AppState {
-    /// Trigger a redraw of the UI
+    /// Trigger a redraw of the UI if needed
     pub fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
+        if !self.needs_redraw {
+            return;
+        }
+        self.needs_redraw = false;
+
         // Clone the layer surface to avoid borrow issues
         let layer = match self.layer_surface.as_ref() {
             Some(l) => l.clone(),
@@ -532,11 +622,12 @@ impl AppState {
         let width = self.width as usize;
         let height = self.height as usize;
 
-        // Fill with dark background
+        // Fill with background color
+        let bg = self.colors.background;
         for pixel in canvas.chunks_exact_mut(4) {
-            pixel[0] = 40;  // B
-            pixel[1] = 40;  // G
-            pixel[2] = 40;  // R
+            pixel[0] = bg.2; // B
+            pixel[1] = bg.1; // G
+            pixel[2] = bg.0; // R
             pixel[3] = 255; // A
         }
 
@@ -546,21 +637,43 @@ impl AppState {
         const INPUT_HEIGHT: usize = 40;
         const ENTRY_HEIGHT: usize = 32;
 
-        // Draw input box background (slightly lighter)
-        fill_rect(canvas, width, PADDING, PADDING, width - 2 * PADDING, INPUT_HEIGHT, 60, 60, 60);
+        // Draw input box background
+        let bg_light = self.colors.background_light;
+        fill_rect(
+            canvas,
+            width,
+            PADDING,
+            PADDING,
+            width - 2 * PADDING,
+            INPUT_HEIGHT,
+            bg_light.0,
+            bg_light.1,
+            bg_light.2,
+        );
 
-        // Draw query text in input box
+        // Draw query text in input box (vertically centered)
         let query_display = if self.query.is_empty() {
             "Type to search..."
         } else {
             &self.query
         };
         let text_color = if self.query.is_empty() {
-            (120, 120, 120) // Gray for placeholder
+            self.colors.foreground_subtle
         } else {
-            (255, 255, 255) // White for typed text
+            self.colors.foreground_bright
         };
-        draw_text(&self.font, canvas, width, height, query_display, PADDING + 8, PADDING + 12, FONT_SIZE, text_color);
+        draw_text_centered(
+            &self.font,
+            canvas,
+            width,
+            height,
+            query_display,
+            PADDING + 8,
+            PADDING,
+            INPUT_HEIGHT,
+            FONT_SIZE,
+            text_color,
+        );
 
         // Draw entries list
         let entries_start_y = PADDING + INPUT_HEIGHT + PADDING;
@@ -568,34 +681,82 @@ impl AppState {
 
         if self.entries.is_empty() && !self.query.is_empty() {
             // Show "No matches" when search returns no results
-            draw_text(&self.font, canvas, width, height, "No matches", PADDING + 8, entries_start_y + 6, FONT_SIZE, (120, 120, 120));
+            draw_text_centered(
+                &self.font,
+                canvas,
+                width,
+                height,
+                "No matches",
+                PADDING + 8,
+                entries_start_y,
+                ENTRY_HEIGHT,
+                FONT_SIZE,
+                self.colors.foreground_subtle,
+            );
         } else {
             for (i, (name, login)) in self.entries.iter().take(max_visible).enumerate() {
                 let y = entries_start_y + i * ENTRY_HEIGHT;
 
                 // Highlight selected entry
                 if i == self.selected_index {
-                    fill_rect(canvas, width, PADDING, y, width - 2 * PADDING, ENTRY_HEIGHT - 4, 80, 120, 180);
+                    let sel = self.colors.selection;
+                    fill_rect(
+                        canvas,
+                        width,
+                        PADDING,
+                        y,
+                        width - 2 * PADDING,
+                        ENTRY_HEIGHT,
+                        sel.0,
+                        sel.1,
+                        sel.2,
+                    );
                 }
 
-                // Format entry as "name - login"
+                // Format entry as "name - login" (vertically centered)
                 let entry_text = format!("{} - {}", name, login);
                 let color = if i == self.selected_index {
-                    (255, 255, 255)
+                    self.colors.foreground_bright
                 } else {
-                    (200, 200, 200)
+                    self.colors.foreground
                 };
-                draw_text(&self.font, canvas, width, height, &entry_text, PADDING + 8, y + 6, FONT_SIZE, color);
+                draw_text_centered(
+                    &self.font,
+                    canvas,
+                    width,
+                    height,
+                    &entry_text,
+                    PADDING + 8,
+                    y,
+                    ENTRY_HEIGHT,
+                    FONT_SIZE,
+                    color,
+                );
             }
         }
 
         // Draw keyboard hints at bottom
+        const HINTS_HEIGHT: usize = 20;
+        const HINTS_FONT_SIZE: f32 = 14.0;
         let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
-        let hints_y = height - PADDING - 16;
-        draw_text(&self.font, canvas, width, height, hints, PADDING, hints_y, 14.0, (100, 100, 100));
+        let hints_y = height - PADDING - HINTS_HEIGHT;
+        draw_text_centered(
+            &self.font,
+            canvas,
+            width,
+            height,
+            hints,
+            PADDING,
+            hints_y,
+            HINTS_HEIGHT,
+            HINTS_FONT_SIZE,
+            self.colors.foreground_subtle,
+        );
 
         layer.wl_surface().attach(Some(buffer.wl_buffer()), 0, 0);
-        layer.wl_surface().damage_buffer(0, 0, self.width as i32, self.height as i32);
+        layer
+            .wl_surface()
+            .damage_buffer(0, 0, self.width as i32, self.height as i32);
         layer.wl_surface().commit();
     }
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::keepassxc::LoginEntry;
+use crate::database::Entry;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FrecencyData {
@@ -51,7 +51,7 @@ impl FrecencyData {
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
-    pub entry: LoginEntry,
+    pub entry: Entry,
     pub score: u32,
     pub frecency: f64,
 }
@@ -70,7 +70,7 @@ impl Searcher {
     pub fn search(
         &mut self,
         query: &str,
-        entries: &[LoginEntry],
+        entries: &[Entry],
         frecency: &FrecencyData,
     ) -> Vec<SearchResult> {
         if query.is_empty() {
@@ -92,8 +92,8 @@ impl Searcher {
         let mut buf = Vec::new();
 
         for entry in entries {
-            // Search in name and login
-            let search_text = format!("{} {}", entry.name, entry.login);
+            // Search in title and username
+            let search_text = format!("{} {}", entry.title, entry.username);
             let haystack = Utf32Str::new(&search_text, &mut buf);
 
             if let Some(score) = pattern.score(haystack, &mut self.matcher) {
