@@ -1,3 +1,7 @@
+#![allow(dead_code)]
+// Note: This module is currently unused; we use custom fontdue-based rendering instead.
+// Kept for potential future egui integration.
+
 use egui::{Context, RawInput, Rect, Vec2};
 use tiny_skia::{Color, Pixmap};
 

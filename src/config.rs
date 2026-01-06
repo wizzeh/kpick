@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
+use crate::search::FrecencyData;
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Could not determine config directory")]
@@ -23,6 +25,8 @@ pub struct Association {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub association: Option<Association>,
+    #[serde(default)]
+    pub frecency: FrecencyData,
 }
 
 impl Config {

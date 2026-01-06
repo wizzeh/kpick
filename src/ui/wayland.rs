@@ -23,7 +23,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, EventQueue, QueueHandle,
 };
 
 /// Attempts to load a system font, trying common paths
@@ -72,6 +72,7 @@ pub struct AppState {
     shm: Shm,
     pool: Option<SlotPool>,
 
+    #[allow(dead_code)]
     layer_shell: LayerShell,
     layer_surface: Option<LayerSurface>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -94,25 +95,27 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(conn: &Connection, qh: &QueueHandle<Self>) -> Self {
-        let (globals, _event_queue) = registry_queue_init::<Self>(conn).unwrap();
+    /// Create a new AppState and its associated event queue
+    pub fn new(conn: &Connection) -> (Self, EventQueue<Self>) {
+        let (globals, event_queue) = registry_queue_init::<Self>(conn).unwrap();
+        let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
 
-        let shm = Shm::bind(&globals, qh).expect("wl_shm not available");
-        let compositor = CompositorState::bind(&globals, qh).expect("wl_compositor not available");
-        let layer_shell = LayerShell::bind(&globals, qh).expect("layer shell not available");
-        let seat_state = SeatState::new(&globals, qh);
-        let output_state = OutputState::new(&globals, qh);
+        let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
+        let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
+        let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell not available");
+        let seat_state = SeatState::new(&globals, &qh);
+        let output_state = OutputState::new(&globals, &qh);
 
         // Load our font for text rendering
         let font = load_system_font();
 
         // Create our surface
-        let surface = compositor.create_surface(qh);
+        let surface = compositor.create_surface(&qh);
 
         // Create layer surface
         let layer_surface = layer_shell.create_layer_surface(
-            qh,
+            &qh,
             surface,
             Layer::Overlay,
             Some("kpick"),
@@ -126,7 +129,7 @@ impl AppState {
         layer_surface.set_margin(100, 0, 0, 0); // 100px from top
         layer_surface.commit();
 
-        Self {
+        let state = Self {
             running: true,
             width: 600,
             height: 400,
@@ -146,6 +149,25 @@ impl AppState {
             on_select: None,
             on_escape: None,
             on_query_change: None,
+        };
+
+        (state, event_queue)
+    }
+
+    /// Run the event loop until the user makes a selection or presses escape
+    #[allow(dead_code)]
+    pub fn run(&mut self, conn: &Connection, event_queue: &mut EventQueue<Self>) {
+        let qh = event_queue.handle();
+
+        while self.running {
+            // Flush pending requests
+            conn.flush().unwrap();
+
+            // Blocking dispatch - waits for events
+            event_queue.blocking_dispatch(self).unwrap();
+
+            // Redraw after processing events
+            self.request_redraw(&qh);
         }
     }
 
@@ -261,8 +283,9 @@ impl LayerShellHandler for AppState {
             );
         }
 
-        // Initial draw
-        self.draw(qh, layer);
+        // Initial draw - clone layer to avoid borrow issues
+        let layer_clone = layer.clone();
+        self.draw(qh, &layer_clone);
     }
 }
 
@@ -422,9 +445,80 @@ impl ProvidesRegistryState for AppState {
     registry_handlers!(OutputState, SeatState);
 }
 
+/// Fill a rectangle with a solid color (free function to avoid borrow issues)
+fn fill_rect(canvas: &mut [u8], stride: usize, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+    for row in y..(y + h) {
+        for col in x..(x + w) {
+            let idx = (row * stride + col) * 4;
+            if idx + 3 < canvas.len() {
+                canvas[idx] = b;     // B
+                canvas[idx + 1] = g; // G
+                canvas[idx + 2] = r; // R
+                canvas[idx + 3] = 255; // A
+            }
+        }
+    }
+}
+
+/// Draw text at position using fontdue (free function to avoid borrow issues)
+fn draw_text(font: &Font, canvas: &mut [u8], stride: usize, canvas_height: usize, text: &str, x: usize, y: usize, size: f32, color: (u8, u8, u8)) {
+    let mut cursor_x = x as i32;
+    let (r, g, b) = color;
+
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, size);
+
+        // Calculate glyph position
+        let glyph_x = cursor_x + metrics.xmin;
+        let glyph_y = y as i32 + (size as i32 - metrics.height as i32 - metrics.ymin);
+
+        // Copy glyph bitmap to canvas
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let px = glyph_x + col as i32;
+                let py = glyph_y + row as i32;
+
+                if px >= 0 && (px as usize) < stride && py >= 0 && (py as usize) < canvas_height {
+                    let alpha = bitmap[row * metrics.width + col];
+                    if alpha > 0 {
+                        let idx = (py as usize * stride + px as usize) * 4;
+                        if idx + 3 < canvas.len() {
+                            // Alpha blend the glyph onto the background
+                            let bg_b = canvas[idx] as u16;
+                            let bg_g = canvas[idx + 1] as u16;
+                            let bg_r = canvas[idx + 2] as u16;
+                            let a = alpha as u16;
+                            let inv_a = 255 - a;
+
+                            canvas[idx] = ((b as u16 * a + bg_b * inv_a) / 255) as u8;
+                            canvas[idx + 1] = ((g as u16 * a + bg_g * inv_a) / 255) as u8;
+                            canvas[idx + 2] = ((r as u16 * a + bg_r * inv_a) / 255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor_x += metrics.advance_width as i32;
+    }
+}
+
 impl AppState {
+    /// Trigger a redraw of the UI
+    pub fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
+        // Clone the layer surface to avoid borrow issues
+        let layer = match self.layer_surface.as_ref() {
+            Some(l) => l.clone(),
+            None => return,
+        };
+        self.draw(qh, &layer);
+    }
+
     fn draw(&mut self, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        let pool = self.pool.as_mut().unwrap();
+        let pool = match self.pool.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
         let stride = self.width as i32 * 4;
         let (buffer, canvas) = pool
             .create_buffer(
@@ -453,7 +547,7 @@ impl AppState {
         const ENTRY_HEIGHT: usize = 32;
 
         // Draw input box background (slightly lighter)
-        self.fill_rect(canvas, width, PADDING, PADDING, width - 2 * PADDING, INPUT_HEIGHT, 60, 60, 60);
+        fill_rect(canvas, width, PADDING, PADDING, width - 2 * PADDING, INPUT_HEIGHT, 60, 60, 60);
 
         // Draw query text in input box
         let query_display = if self.query.is_empty() {
@@ -466,96 +560,43 @@ impl AppState {
         } else {
             (255, 255, 255) // White for typed text
         };
-        self.draw_text(canvas, width, height, query_display, PADDING + 8, PADDING + 12, FONT_SIZE, text_color);
+        draw_text(&self.font, canvas, width, height, query_display, PADDING + 8, PADDING + 12, FONT_SIZE, text_color);
 
         // Draw entries list
         let entries_start_y = PADDING + INPUT_HEIGHT + PADDING;
         let max_visible = ((height - entries_start_y - 40) / ENTRY_HEIGHT).min(10);
 
-        for (i, (name, login)) in self.entries.iter().take(max_visible).enumerate() {
-            let y = entries_start_y + i * ENTRY_HEIGHT;
+        if self.entries.is_empty() && !self.query.is_empty() {
+            // Show "No matches" when search returns no results
+            draw_text(&self.font, canvas, width, height, "No matches", PADDING + 8, entries_start_y + 6, FONT_SIZE, (120, 120, 120));
+        } else {
+            for (i, (name, login)) in self.entries.iter().take(max_visible).enumerate() {
+                let y = entries_start_y + i * ENTRY_HEIGHT;
 
-            // Highlight selected entry
-            if i == self.selected_index {
-                self.fill_rect(canvas, width, PADDING, y, width - 2 * PADDING, ENTRY_HEIGHT - 4, 80, 120, 180);
+                // Highlight selected entry
+                if i == self.selected_index {
+                    fill_rect(canvas, width, PADDING, y, width - 2 * PADDING, ENTRY_HEIGHT - 4, 80, 120, 180);
+                }
+
+                // Format entry as "name - login"
+                let entry_text = format!("{} - {}", name, login);
+                let color = if i == self.selected_index {
+                    (255, 255, 255)
+                } else {
+                    (200, 200, 200)
+                };
+                draw_text(&self.font, canvas, width, height, &entry_text, PADDING + 8, y + 6, FONT_SIZE, color);
             }
-
-            // Format entry as "name - login"
-            let entry_text = format!("{} - {}", name, login);
-            let color = if i == self.selected_index {
-                (255, 255, 255)
-            } else {
-                (200, 200, 200)
-            };
-            self.draw_text(canvas, width, height, &entry_text, PADDING + 8, y + 6, FONT_SIZE, color);
         }
 
         // Draw keyboard hints at bottom
         let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
         let hints_y = height - PADDING - 16;
-        self.draw_text(canvas, width, height, hints, PADDING, hints_y, 14.0, (100, 100, 100));
+        draw_text(&self.font, canvas, width, height, hints, PADDING, hints_y, 14.0, (100, 100, 100));
 
         layer.wl_surface().attach(Some(buffer.wl_buffer()), 0, 0);
         layer.wl_surface().damage_buffer(0, 0, self.width as i32, self.height as i32);
         layer.wl_surface().commit();
-    }
-
-    /// Fill a rectangle with a solid color
-    fn fill_rect(&self, canvas: &mut [u8], stride: usize, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
-        for row in y..(y + h) {
-            for col in x..(x + w) {
-                let idx = (row * stride + col) * 4;
-                if idx + 3 < canvas.len() {
-                    canvas[idx] = b;     // B
-                    canvas[idx + 1] = g; // G
-                    canvas[idx + 2] = r; // R
-                    canvas[idx + 3] = 255; // A
-                }
-            }
-        }
-    }
-
-    /// Draw text at position using fontdue
-    fn draw_text(&self, canvas: &mut [u8], stride: usize, canvas_height: usize, text: &str, x: usize, y: usize, size: f32, color: (u8, u8, u8)) {
-        let mut cursor_x = x as i32;
-        let (r, g, b) = color;
-
-        for ch in text.chars() {
-            let (metrics, bitmap) = self.font.rasterize(ch, size);
-
-            // Calculate glyph position
-            let glyph_x = cursor_x + metrics.xmin;
-            let glyph_y = y as i32 + (size as i32 - metrics.height as i32 - metrics.ymin);
-
-            // Copy glyph bitmap to canvas
-            for row in 0..metrics.height {
-                for col in 0..metrics.width {
-                    let px = glyph_x + col as i32;
-                    let py = glyph_y + row as i32;
-
-                    if px >= 0 && (px as usize) < stride && py >= 0 && (py as usize) < canvas_height {
-                        let alpha = bitmap[row * metrics.width + col];
-                        if alpha > 0 {
-                            let idx = (py as usize * stride + px as usize) * 4;
-                            if idx + 3 < canvas.len() {
-                                // Alpha blend the glyph onto the background
-                                let bg_b = canvas[idx] as u16;
-                                let bg_g = canvas[idx + 1] as u16;
-                                let bg_r = canvas[idx + 2] as u16;
-                                let a = alpha as u16;
-                                let inv_a = 255 - a;
-
-                                canvas[idx] = ((b as u16 * a + bg_b * inv_a) / 255) as u8;
-                                canvas[idx + 1] = ((g as u16 * a + bg_g * inv_a) / 255) as u8;
-                                canvas[idx + 2] = ((r as u16 * a + bg_r * inv_a) / 255) as u8;
-                            }
-                        }
-                    }
-                }
-            }
-
-            cursor_x += metrics.advance_width as i32;
-        }
     }
 }
 

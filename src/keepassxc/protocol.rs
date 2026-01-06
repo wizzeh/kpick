@@ -25,6 +25,7 @@ pub struct Message {
 }
 
 /// Encrypted payload for change-public-keys (inside message field)
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangePublicKeysRequest {

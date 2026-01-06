@@ -12,6 +12,7 @@ pub enum ClientError {
     NotRunning,
     #[error("Database is locked")]
     DatabaseLocked,
+    #[allow(dead_code)]
     #[error("Not associated with database")]
     NotAssociated,
     #[error("IO error: {0}")]
@@ -127,6 +128,7 @@ impl KeePassXCClient {
     }
 
     /// Get the client ID for this session
+    #[allow(dead_code)]
     pub fn client_id(&self) -> &str {
         &self.client_id
     }
