@@ -1,5 +1,6 @@
 use fontdue::{Font, FontSettings};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::config::ColorSchemeRgb;
@@ -39,39 +40,81 @@ use wayland_client::{
     Connection, EventQueue, QueueHandle,
 };
 
-/// Attempts to load a system font, trying common paths
-fn load_system_font() -> Font {
-    // Common font paths on Linux/NixOS
-    let font_paths = [
-        "/usr/share/fonts/DejaVuSans.ttf",
-        "/usr/share/fonts/LiberationSans-Regular.ttf",
-        "/run/current-system/sw/share/X11/fonts/DejaVuSans.ttf",
-        "/run/current-system/sw/share/X11/fonts/LiberationSans-Regular.ttf",
+/// Attempts to load a font by family name from system directories
+fn load_font_by_family(family: &str) -> Font {
+    let search_dirs = [
+        "/usr/share/fonts",
+        "/usr/local/share/fonts",
+        "/run/current-system/sw/share/X11/fonts",
     ];
 
-    for path in &font_paths {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(font) = Font::from_bytes(data, FontSettings::default()) {
-                return font;
-            }
+    // Also check ~/.local/share/fonts
+    let home_fonts = dirs::home_dir().map(|h| h.join(".local/share/fonts"));
+
+    let family_lower = family.to_lowercase();
+
+    // Search for font matching family name
+    for dir in search_dirs.iter().map(PathBuf::from).chain(home_fonts) {
+        if let Some(font) = search_font_dir(&dir, &family_lower) {
+            return font;
         }
     }
 
-    // Fallback: try to find any TTF font
-    if let Ok(entries) = std::fs::read_dir("/usr/share/fonts") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "ttf") {
-                if let Ok(data) = std::fs::read(&path) {
+    // Fallback: try to find any TTF
+    for dir in search_dirs.iter().map(PathBuf::from) {
+        if let Some(font) = find_any_font(&dir) {
+            return font;
+        }
+    }
+
+    panic!("No fonts found. Please install DejaVu Sans or another TTF font.");
+}
+
+fn search_font_dir(dir: &Path, family_lower: &str) -> Option<Font> {
+    let entries = fs::read_dir(dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(font) = search_font_dir(&path, family_lower) {
+                return Some(font);
+            }
+        } else if path.extension().map_or(false, |e| e == "ttf" || e == "otf") {
+            let name = path.file_stem()?.to_string_lossy().to_lowercase();
+            // Match if filename contains family name (handles "DejaVuSans", "DejaVu-Sans", etc.)
+            let family_normalized = family_lower.replace(' ', "");
+            if name.contains(&family_normalized) || name.contains(family_lower) {
+                if let Ok(data) = fs::read(&path) {
                     if let Ok(font) = Font::from_bytes(data, FontSettings::default()) {
-                        return font;
+                        return Some(font);
                     }
                 }
             }
         }
     }
+    None
+}
 
-    panic!("No system font found. Please install DejaVu Sans or Liberation Sans.");
+fn find_any_font(dir: &Path) -> Option<Font> {
+    let entries = fs::read_dir(dir).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+
+        if path.is_dir() {
+            if let Some(font) = find_any_font(&path) {
+                return Some(font);
+            }
+        } else if path.extension().map_or(false, |e| e == "ttf") {
+            if let Ok(data) = fs::read(&path) {
+                if let Ok(font) = Font::from_bytes(data, FontSettings::default()) {
+                    return Some(font);
+                }
+            }
+        }
+    }
+    None
 }
 
 pub struct AppState {
@@ -149,7 +192,7 @@ impl AppState {
         let output_state = OutputState::new(&globals, &qh);
 
         // Load our font for text rendering
-        let font = load_system_font();
+        let font = load_font_by_family("DejaVu Sans");
 
         // Create our surface
         let surface = compositor.create_surface(&qh);
