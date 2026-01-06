@@ -37,6 +37,9 @@ pub struct ColorScheme {
     /// Bright foreground for selected items
     #[serde(default = "ColorScheme::default_foreground_bright")]
     pub foreground_bright: String,
+    /// Error color
+    #[serde(default = "ColorScheme::default_error")]
+    pub error: String,
 }
 
 impl ColorScheme {
@@ -46,6 +49,7 @@ impl ColorScheme {
     fn default_foreground_subtle() -> String { "#6e6e6e".to_string() }
     fn default_foreground() -> String { "#cccccc".to_string() }
     fn default_foreground_bright() -> String { "#ffffff".to_string() }
+    fn default_error() -> String { "#ff6b6b".to_string() }
 
     /// Parse a hex color string like "#RRGGBB" to (R, G, B)
     pub fn parse_hex(hex: &str) -> (u8, u8, u8) {
@@ -68,6 +72,7 @@ impl ColorScheme {
             foreground_subtle: Self::parse_hex(&self.foreground_subtle),
             foreground: Self::parse_hex(&self.foreground),
             foreground_bright: Self::parse_hex(&self.foreground_bright),
+            error: Self::parse_hex(&self.error),
         }
     }
 }
@@ -81,6 +86,7 @@ impl Default for ColorScheme {
             foreground_subtle: Self::default_foreground_subtle(),
             foreground: Self::default_foreground(),
             foreground_bright: Self::default_foreground_bright(),
+            error: Self::default_error(),
         }
     }
 }
@@ -94,6 +100,7 @@ pub struct ColorSchemeRgb {
     pub foreground_subtle: (u8, u8, u8),
     pub foreground: (u8, u8, u8),
     pub foreground_bright: (u8, u8, u8),
+    pub error: (u8, u8, u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

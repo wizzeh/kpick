@@ -1,3 +1,3 @@
 pub mod wayland;
 
-pub use wayland::AppState;
+pub use wayland::{AppState, Mode};

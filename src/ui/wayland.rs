@@ -1,6 +1,16 @@
 use fontdue::{Font, FontSettings};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::config::ColorSchemeRgb;
+use crate::database::{open_database, Entry};
+
+/// UI mode - password entry or entry picker
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Password,
+    Picker,
+}
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -87,28 +97,43 @@ pub struct AppState {
     // Color scheme
     colors: ColorSchemeRgb,
 
-    // Input state
+    // Current mode
+    pub mode: Mode,
+
+    // Password mode state
+    password: String,
+    password_error: Option<String>,
+    last_keypress: Option<Instant>,  // Time of last password keypress for flash
+    db_path: PathBuf,
+
+    // Picker mode state
     pub query: String,
     pub selected_index: usize,
-
-    // Entries to display: (name, login) pairs
     pub entries: Vec<(String, String)>,
 
     // Callbacks for when user makes a selection
     pub on_select: Option<Box<dyn FnMut(usize)>>,
     pub on_escape: Option<Box<dyn FnMut()>>,
     pub on_query_change: Option<Box<dyn FnMut(&str)>>,
+    pub on_unlock: Option<Box<dyn FnMut(Vec<Entry>)>>,
 
     // Track if we need to redraw
     needs_redraw: bool,
 
+    // Track if we're waiting for a frame callback (prevents drawing too fast)
+    frame_pending: bool,
+
     // Track if we've sized to the output yet
     sized_to_output: bool,
+
+    // Screen dimensions for resizing
+    screen_width: u32,
+    screen_height: u32,
 }
 
 impl AppState {
     /// Create a new AppState and its associated event queue
-    pub fn new(conn: &Connection, colors: ColorSchemeRgb) -> (Self, EventQueue<Self>) {
+    pub fn new(conn: &Connection, colors: ColorSchemeRgb, db_path: PathBuf) -> (Self, EventQueue<Self>) {
         let (globals, event_queue) = registry_queue_init::<Self>(conn).unwrap();
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
@@ -131,14 +156,14 @@ impl AppState {
 
         // Configure layer surface - no anchor means centered
         layer_surface.set_anchor(Anchor::empty());
-        layer_surface.set_size(800, 400); // Temporary
+        layer_surface.set_size(400, 172); // Temporary - will resize based on mode
         layer_surface.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer_surface.commit();
 
         let state = Self {
             running: true,
-            width: 800,
-            height: 400,
+            width: 400,
+            height: 172,
             registry_state,
             seat_state,
             output_state,
@@ -150,14 +175,23 @@ impl AppState {
             pointer: None,
             font,
             colors,
+            mode: Mode::Password,
+            password: String::new(),
+            password_error: None,
+            last_keypress: None,
+            db_path,
             query: String::new(),
             selected_index: 0,
             entries: Vec::new(),
             on_select: None,
             on_escape: None,
             on_query_change: None,
+            on_unlock: None,
             needs_redraw: true,
+            frame_pending: false,
             sized_to_output: false,
+            screen_width: 0,
+            screen_height: 0,
         };
 
         (state, event_queue)
@@ -220,6 +254,9 @@ impl CompositorHandler for AppState {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        // Frame callback fires when compositor displays our frame
+        // Clear the pending flag so we can draw again
+        self.frame_pending = false;
     }
 
     fn surface_enter(
@@ -235,12 +272,14 @@ impl CompositorHandler for AppState {
         }
         self.sized_to_output = true;
 
-        // Get the output dimensions
+        // Get and store output dimensions
         if let Some(info) = self.output_state.info(output) {
             if let Some((screen_width, screen_height)) = info.logical_size {
-                // Calculate window size: 50% width, 40% height
-                let width = screen_width as u32 / 2;
-                let height = screen_height as u32 * 2 / 5;
+                self.screen_width = screen_width as u32;
+                self.screen_height = screen_height as u32;
+
+                // Size based on current mode
+                let (width, height) = self.size_for_mode();
 
                 self.width = width;
                 self.height = height;
@@ -398,54 +437,9 @@ impl KeyboardHandler for AppState {
         _serial: u32,
         event: KeyEvent,
     ) {
-        match event.keysym {
-            Keysym::Escape => {
-                if let Some(ref mut cb) = self.on_escape {
-                    cb();
-                }
-                self.running = false;
-            }
-            Keysym::Return | Keysym::KP_Enter => {
-                if let Some(ref mut cb) = self.on_select {
-                    cb(self.selected_index);
-                }
-                self.running = false;
-            }
-            Keysym::Up => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                    self.needs_redraw = true;
-                }
-            }
-            Keysym::Down => {
-                if self.selected_index + 1 < self.entries.len() {
-                    self.selected_index += 1;
-                    self.needs_redraw = true;
-                }
-            }
-            Keysym::BackSpace => {
-                if !self.query.is_empty() {
-                    self.query.pop();
-                    self.selected_index = 0;
-                    self.needs_redraw = true;
-                    if let Some(ref mut cb) = self.on_query_change {
-                        cb(&self.query);
-                    }
-                }
-            }
-            _ => {
-                // Handle text input
-                if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
-                    if c.is_ascii_graphic() || c == ' ' {
-                        self.query.push(c);
-                        self.selected_index = 0;
-                        self.needs_redraw = true;
-                        if let Some(ref mut cb) = self.on_query_change {
-                            cb(&self.query);
-                        }
-                    }
-                }
-            }
+        match self.mode {
+            Mode::Password => self.handle_password_key(event),
+            Mode::Picker => self.handle_picker_key(event),
         }
     }
 
@@ -589,9 +583,56 @@ fn draw_text_centered(
 }
 
 impl AppState {
+    /// Calculate appropriate window size for current mode
+    fn size_for_mode(&self) -> (u32, u32) {
+        match self.mode {
+            Mode::Password => {
+                // Password mode: compact size
+                // Content height: label (32) + padding (8) + input (40) + error space (40) + hints (20) + padding (32)
+                let content_height = 172u32;
+                let content_width = 400u32;
+
+                // Use content size, but cap at 40% of screen
+                let max_width = self.screen_width * 2 / 5;
+                let max_height = self.screen_height * 2 / 5;
+
+                let width = content_width.min(max_width).max(300);
+                let height = content_height.min(max_height).max(150);
+
+                (width, height)
+            }
+            Mode::Picker => {
+                // Picker mode: 50% width, 40% height
+                let width = self.screen_width / 2;
+                let height = self.screen_height * 2 / 5;
+                (width.max(400), height.max(200))
+            }
+        }
+    }
+
+    /// Resize window for current mode
+    fn resize_for_mode(&mut self) {
+        let (width, height) = self.size_for_mode();
+
+        if width != self.width || height != self.height {
+            self.width = width;
+            self.height = height;
+
+            if let Some(ref layer) = self.layer_surface {
+                layer.set_size(width, height);
+                layer.commit();
+            }
+
+            // Need to recreate the buffer pool for new size
+            self.pool = None;
+            self.needs_redraw = true;
+        }
+    }
+
     /// Trigger a redraw of the UI if needed
     pub fn request_redraw(&mut self, qh: &QueueHandle<Self>) {
-        if !self.needs_redraw {
+        // Don't draw if we're waiting for the previous frame to be displayed
+        if !self.needs_redraw || self.frame_pending {
             return;
         }
         self.needs_redraw = false;
@@ -604,11 +645,130 @@ impl AppState {
         self.draw(qh, &layer);
     }
 
-    fn draw(&mut self, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        let pool = match self.pool.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
+    /// Handle key press in password mode
+    fn handle_password_key(&mut self, event: KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => {
+                if let Some(ref mut cb) = self.on_escape {
+                    cb();
+                }
+                self.running = false;
+            }
+            Keysym::Return | Keysym::KP_Enter => {
+                self.try_unlock();
+            }
+            Keysym::BackSpace => {
+                if !self.password.is_empty() {
+                    self.password.pop();
+                    self.password_error = None;
+                    self.last_keypress = Some(Instant::now());
+                    self.needs_redraw = true;
+                }
+            }
+            _ => {
+                // Handle text input for password
+                if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
+                    // Accept printable characters
+                    if !c.is_control() {
+                        self.password.push(c);
+                        self.password_error = None;
+                        self.last_keypress = Some(Instant::now());
+                        self.needs_redraw = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle key press in picker mode
+    fn handle_picker_key(&mut self, event: KeyEvent) {
+        match event.keysym {
+            Keysym::Escape => {
+                if let Some(ref mut cb) = self.on_escape {
+                    cb();
+                }
+                self.running = false;
+            }
+            Keysym::Return | Keysym::KP_Enter => {
+                if let Some(ref mut cb) = self.on_select {
+                    cb(self.selected_index);
+                }
+                self.running = false;
+            }
+            Keysym::Up => {
+                if self.selected_index > 0 {
+                    self.selected_index -= 1;
+                    self.needs_redraw = true;
+                }
+            }
+            Keysym::Down => {
+                if self.selected_index + 1 < self.entries.len() {
+                    self.selected_index += 1;
+                    self.needs_redraw = true;
+                }
+            }
+            Keysym::BackSpace => {
+                if !self.query.is_empty() {
+                    self.query.pop();
+                    self.selected_index = 0;
+                    self.needs_redraw = true;
+                    if let Some(ref mut cb) = self.on_query_change {
+                        cb(&self.query);
+                    }
+                }
+            }
+            _ => {
+                // Handle text input
+                if let Some(c) = event.utf8.as_ref().and_then(|s| s.chars().next()) {
+                    if c.is_ascii_graphic() || c == ' ' {
+                        self.query.push(c);
+                        self.selected_index = 0;
+                        self.needs_redraw = true;
+                        if let Some(ref mut cb) = self.on_query_change {
+                            cb(&self.query);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Try to unlock the database with the current password
+    fn try_unlock(&mut self) {
+        match open_database(&self.db_path, &self.password) {
+            Ok(entries) => {
+                // Success - call callback and switch to picker mode
+                if let Some(ref mut cb) = self.on_unlock {
+                    cb(entries);
+                }
+                self.password.clear();
+                self.password_error = None;
+                self.mode = Mode::Picker;
+                self.resize_for_mode();
+                self.needs_redraw = true;
+            }
+            Err(crate::database::DatabaseError::InvalidPassword) => {
+                self.password_error = Some("Invalid password".to_string());
+                self.password.clear();
+                self.needs_redraw = true;
+            }
+            Err(e) => {
+                self.password_error = Some(format!("Error: {}", e));
+                self.needs_redraw = true;
+            }
+        }
+    }
+
+    fn draw(&mut self, qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        // Recreate pool if needed (e.g., after resize)
+        if self.pool.is_none() {
+            self.pool = Some(
+                SlotPool::new(self.width as usize * self.height as usize * 4, &self.shm)
+                    .expect("Failed to create pool"),
+            );
+        }
+
+        let pool = self.pool.as_mut().unwrap();
         let stride = self.width as i32 * 4;
         let (buffer, canvas) = pool
             .create_buffer(
@@ -631,134 +791,307 @@ impl AppState {
             pixel[3] = 255; // A
         }
 
-        // Constants for layout
-        const FONT_SIZE: f32 = 18.0;
-        const PADDING: usize = 16;
-        const INPUT_HEIGHT: usize = 40;
-        const ENTRY_HEIGHT: usize = 32;
+        const FLASH_DURATION: Duration = Duration::from_millis(150);
 
-        // Draw input box background
-        let bg_light = self.colors.background_light;
-        fill_rect(
-            canvas,
-            width,
-            PADDING,
-            PADDING,
-            width - 2 * PADDING,
-            INPUT_HEIGHT,
-            bg_light.0,
-            bg_light.1,
-            bg_light.2,
-        );
+        match self.mode {
+            Mode::Password => {
+                // Check if we're within the flash window
+                let flash_active = self.last_keypress
+                    .map(|t| t.elapsed() < FLASH_DURATION)
+                    .unwrap_or(false);
 
-        // Draw query text in input box (vertically centered)
-        let query_display = if self.query.is_empty() {
-            "Type to search..."
-        } else {
-            &self.query
-        };
-        let text_color = if self.query.is_empty() {
-            self.colors.foreground_subtle
-        } else {
-            self.colors.foreground_bright
-        };
-        draw_text_centered(
-            &self.font,
-            canvas,
-            width,
-            height,
-            query_display,
-            PADDING + 8,
-            PADDING,
-            INPUT_HEIGHT,
-            FONT_SIZE,
-            text_color,
-        );
-
-        // Draw entries list
-        let entries_start_y = PADDING + INPUT_HEIGHT + PADDING;
-        let max_visible = ((height - entries_start_y - 40) / ENTRY_HEIGHT).min(10);
-
-        if self.entries.is_empty() && !self.query.is_empty() {
-            // Show "No matches" when search returns no results
-            draw_text_centered(
-                &self.font,
-                canvas,
-                width,
-                height,
-                "No matches",
-                PADDING + 8,
-                entries_start_y,
-                ENTRY_HEIGHT,
-                FONT_SIZE,
-                self.colors.foreground_subtle,
-            );
-        } else {
-            for (i, (name, login)) in self.entries.iter().take(max_visible).enumerate() {
-                let y = entries_start_y + i * ENTRY_HEIGHT;
-
-                // Highlight selected entry
-                if i == self.selected_index {
-                    let sel = self.colors.selection;
-                    fill_rect(
-                        canvas,
-                        width,
-                        PADDING,
-                        y,
-                        width - 2 * PADDING,
-                        ENTRY_HEIGHT,
-                        sel.0,
-                        sel.1,
-                        sel.2,
-                    );
-                }
-
-                // Format entry as "name - login" (vertically centered)
-                let entry_text = format!("{} - {}", name, login);
-                let color = if i == self.selected_index {
-                    self.colors.foreground_bright
-                } else {
-                    self.colors.foreground
-                };
-                draw_text_centered(
+                draw_password_mode(
                     &self.font,
                     canvas,
                     width,
                     height,
-                    &entry_text,
-                    PADDING + 8,
-                    y,
-                    ENTRY_HEIGHT,
-                    FONT_SIZE,
-                    color,
+                    &self.colors,
+                    self.password.is_empty(),
+                    self.password_error.as_deref(),
+                    flash_active,
                 );
-            }
-        }
 
-        // Draw keyboard hints at bottom
-        const HINTS_HEIGHT: usize = 20;
-        const HINTS_FONT_SIZE: f32 = 14.0;
-        let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
-        let hints_y = height - PADDING - HINTS_HEIGHT;
-        draw_text_centered(
-            &self.font,
-            canvas,
-            width,
-            height,
-            hints,
-            PADDING,
-            hints_y,
-            HINTS_HEIGHT,
-            HINTS_FONT_SIZE,
-            self.colors.foreground_subtle,
-        );
+                // Keep redrawing while flash is active
+                if flash_active {
+                    self.needs_redraw = true;
+                }
+            }
+            Mode::Picker => draw_picker_mode(
+                &self.font,
+                canvas,
+                width,
+                height,
+                &self.colors,
+                &self.query,
+                &self.entries,
+                self.selected_index,
+            ),
+        }
 
         layer.wl_surface().attach(Some(buffer.wl_buffer()), 0, 0);
         layer
             .wl_surface()
             .damage_buffer(0, 0, self.width as i32, self.height as i32);
+
+        // Request frame callback if we need to keep animating
+        if self.needs_redraw {
+            layer.wl_surface().frame(qh, layer.wl_surface().clone());
+            self.frame_pending = true;
+        }
+
         layer.wl_surface().commit();
     }
+}
+
+fn draw_password_mode(
+    font: &Font,
+    canvas: &mut [u8],
+    width: usize,
+    height: usize,
+    colors: &ColorSchemeRgb,
+    password_is_empty: bool,
+    password_error: Option<&str>,
+    flash: bool,
+) {
+    const FONT_SIZE: f32 = 18.0;
+    const PADDING: usize = 16;
+    const INPUT_HEIGHT: usize = 40;
+    const LABEL_HEIGHT: usize = 32;
+
+    // Center the password prompt vertically
+    let total_height = LABEL_HEIGHT + PADDING + INPUT_HEIGHT;
+    let start_y = (height - total_height) / 2;
+
+    // Draw "Master Password:" label
+    draw_text_centered(
+        font,
+        canvas,
+        width,
+        height,
+        "Master Password:",
+        PADDING + 8,
+        start_y,
+        LABEL_HEIGHT,
+        FONT_SIZE,
+        colors.foreground,
+    );
+
+    // Draw input box background
+    let input_y = start_y + LABEL_HEIGHT + PADDING / 2;
+    let bg_light = colors.background_light;
+    fill_rect(
+        canvas,
+        width,
+        PADDING,
+        input_y,
+        width - 2 * PADDING,
+        INPUT_HEIGHT,
+        bg_light.0,
+        bg_light.1,
+        bg_light.2,
+    );
+
+    // Draw placeholder when empty
+    if password_is_empty {
+        draw_text_centered(
+            font,
+            canvas,
+            width,
+            height,
+            "Enter password...",
+            PADDING + 8,
+            input_y,
+            INPUT_HEIGHT,
+            FONT_SIZE,
+            colors.foreground_subtle,
+        );
+    }
+
+    // Draw flash indicator separately (small dot on the right side of input box)
+    if flash && !password_is_empty {
+        let dot_size = 8usize;
+        let dot_x = width - PADDING - 16 - dot_size;
+        let dot_y = input_y + (INPUT_HEIGHT - dot_size) / 2;
+        fill_rect(
+            canvas,
+            width,
+            dot_x,
+            dot_y,
+            dot_size,
+            dot_size,
+            colors.foreground_bright.0,
+            colors.foreground_bright.1,
+            colors.foreground_bright.2,
+        );
+    }
+
+    // Draw error message if present
+    if let Some(error) = password_error {
+        let error_y = input_y + INPUT_HEIGHT + PADDING;
+        draw_text_centered(
+            font,
+            canvas,
+            width,
+            height,
+            error,
+            PADDING + 8,
+            error_y,
+            LABEL_HEIGHT,
+            FONT_SIZE,
+            colors.error,
+        );
+    }
+
+    // Draw keyboard hints at bottom
+    const HINTS_HEIGHT: usize = 20;
+    const HINTS_FONT_SIZE: f32 = 14.0;
+    let hints = "Enter: unlock | Esc: cancel";
+    let hints_y = height - PADDING - HINTS_HEIGHT;
+    draw_text_centered(
+        font,
+        canvas,
+        width,
+        height,
+        hints,
+        PADDING,
+        hints_y,
+        HINTS_HEIGHT,
+        HINTS_FONT_SIZE,
+        colors.foreground_subtle,
+    );
+}
+
+fn draw_picker_mode(
+    font: &Font,
+    canvas: &mut [u8],
+    width: usize,
+    height: usize,
+    colors: &ColorSchemeRgb,
+    query: &str,
+    entries: &[(String, String)],
+    selected_index: usize,
+) {
+    // Constants for layout
+    const FONT_SIZE: f32 = 18.0;
+    const PADDING: usize = 16;
+    const INPUT_HEIGHT: usize = 40;
+    const ENTRY_HEIGHT: usize = 32;
+
+    // Draw input box background
+    let bg_light = colors.background_light;
+    fill_rect(
+        canvas,
+        width,
+        PADDING,
+        PADDING,
+        width - 2 * PADDING,
+        INPUT_HEIGHT,
+        bg_light.0,
+        bg_light.1,
+        bg_light.2,
+    );
+
+    // Draw query text in input box (vertically centered)
+    let query_display = if query.is_empty() {
+        "Type to search..."
+    } else {
+        query
+    };
+    let text_color = if query.is_empty() {
+        colors.foreground_subtle
+    } else {
+        colors.foreground_bright
+    };
+    draw_text_centered(
+        font,
+        canvas,
+        width,
+        height,
+        query_display,
+        PADDING + 8,
+        PADDING,
+        INPUT_HEIGHT,
+        FONT_SIZE,
+        text_color,
+    );
+
+    // Draw entries list
+    let entries_start_y = PADDING + INPUT_HEIGHT + PADDING;
+    let max_visible = ((height - entries_start_y - 40) / ENTRY_HEIGHT).min(10);
+
+    if entries.is_empty() && !query.is_empty() {
+        // Show "No matches" when search returns no results
+        draw_text_centered(
+            font,
+            canvas,
+            width,
+            height,
+            "No matches",
+            PADDING + 8,
+            entries_start_y,
+            ENTRY_HEIGHT,
+            FONT_SIZE,
+            colors.foreground_subtle,
+        );
+    } else {
+        for (i, (name, login)) in entries.iter().take(max_visible).enumerate() {
+            let y = entries_start_y + i * ENTRY_HEIGHT;
+
+            // Highlight selected entry
+            if i == selected_index {
+                let sel = colors.selection;
+                fill_rect(
+                    canvas,
+                    width,
+                    PADDING,
+                    y,
+                    width - 2 * PADDING,
+                    ENTRY_HEIGHT,
+                    sel.0,
+                    sel.1,
+                    sel.2,
+                );
+            }
+
+            // Format entry as "name - login" (vertically centered)
+            let entry_text = format!("{} - {}", name, login);
+            let color = if i == selected_index {
+                colors.foreground_bright
+            } else {
+                colors.foreground
+            };
+            draw_text_centered(
+                font,
+                canvas,
+                width,
+                height,
+                &entry_text,
+                PADDING + 8,
+                y,
+                ENTRY_HEIGHT,
+                FONT_SIZE,
+                color,
+            );
+        }
+    }
+
+    // Draw keyboard hints at bottom
+    const HINTS_HEIGHT: usize = 20;
+    const HINTS_FONT_SIZE: f32 = 14.0;
+    let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
+    let hints_y = height - PADDING - HINTS_HEIGHT;
+    draw_text_centered(
+        font,
+        canvas,
+        width,
+        height,
+        hints,
+        PADDING,
+        hints_y,
+        HINTS_HEIGHT,
+        HINTS_FONT_SIZE,
+        colors.foreground_subtle,
+    );
 }
 
 delegate_compositor!(AppState);

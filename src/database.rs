@@ -81,12 +81,3 @@ fn collect_entries(group: &keepass::db::Group, path: &str, entries: &mut Vec<Ent
     }
 }
 
-/// Prompt for password securely (hidden input)
-/// If KPICK_PASSWORD env var is set, use that instead (for testing)
-pub fn prompt_password(prompt: &str) -> Result<String, std::io::Error> {
-    if let Ok(pass) = std::env::var("KPICK_PASSWORD") {
-        return Ok(pass);
-    }
-    eprint!("{}", prompt);
-    rpassword::read_password()
-}
