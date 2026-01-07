@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -33,18 +35,36 @@ pub fn copy_with_clear(text: &str, clear_after_secs: u64) -> Result<(), Clipboar
     // Wait for wl-copy to fork its daemon
     child.wait()?;
 
-    // Spawn background process to clear after timeout
-    let escaped = text.replace('\'', "'\"'\"'");
-    Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            r#"sleep {} && [ "$(wl-paste -n 2>/dev/null)" = '{}' ] && wl-copy --clear"#,
-            clear_after_secs, escaped,
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // Skip auto-clear if timeout is 0
+    if clear_after_secs == 0 {
+        return Ok(());
+    }
+
+    // Spawn thread to clear clipboard after timeout
+    // This avoids shell injection by never using shell escaping
+    let expected = text.to_string();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(clear_after_secs));
+
+        // Read current clipboard content
+        let output = Command::new("wl-paste")
+            .arg("-n")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+
+        if let Ok(output) = output {
+            let current = String::from_utf8_lossy(&output.stdout);
+            // Only clear if clipboard still contains our text
+            if current == expected {
+                let _ = Command::new("wl-copy")
+                    .arg("--clear")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
+    });
 
     Ok(())
 }

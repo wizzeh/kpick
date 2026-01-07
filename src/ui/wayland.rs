@@ -2,6 +2,7 @@ use fontdue::{Font, FontSettings};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 use crate::config::{ColorSchemeRgb, Config, PasswordWindowConfig, PickerWindowConfig};
 use crate::database::{open_database, Entry};
@@ -143,8 +144,8 @@ pub struct AppState {
     // Current mode
     pub mode: Mode,
 
-    // Password mode state
-    password: String,
+    // Password mode state (Zeroizing ensures secure memory clearing)
+    password: Zeroizing<String>,
     password_error: Option<String>,
     last_keypress: Option<Instant>,  // Time of last password keypress for flash
     db_path: PathBuf,
@@ -234,7 +235,7 @@ impl AppState {
             font,
             colors,
             mode: Mode::Password,
-            password: String::new(),
+            password: Zeroizing::new(String::new()),
             password_error: None,
             last_keypress: None,
             db_path,

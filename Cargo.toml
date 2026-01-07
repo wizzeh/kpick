@@ -11,9 +11,9 @@ wayland-client = "0.31"
 
 # Database
 keepass = "0.8"
-rpassword = "7.3"
 
 # Core
+zeroize = "1.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
