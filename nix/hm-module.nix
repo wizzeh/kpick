@@ -1,3 +1,4 @@
+{ self }:
 { config, lib, pkgs, ... }:
 
 let
@@ -8,7 +9,12 @@ in
   options.programs.kpick = {
     enable = lib.mkEnableOption "kpick, a KeePassXC password picker for Wayland";
 
-    package = lib.mkPackageOption pkgs "kpick" { };
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = self.packages.${pkgs.system}.default;
+      defaultText = lib.literalExpression "inputs.kpick.packages.\${pkgs.system}.default";
+      description = "The kpick package to install.";
+    };
 
     settings = lib.mkOption {
       type = lib.types.submodule {

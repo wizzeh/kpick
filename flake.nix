@@ -12,7 +12,7 @@
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
     {
-      homeManagerModules.default = import ./nix/hm-module.nix;
+      homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
     } //
     flake-utils.lib.eachDefaultSystem (system:
       let
