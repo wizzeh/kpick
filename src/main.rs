@@ -6,8 +6,10 @@ mod search;
 mod ui;
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use clap::Parser;
 use clipboard::copy_with_clear;
 use config::Config;
 use database::Entry;
@@ -16,7 +18,18 @@ use search::Searcher;
 use ui::{AppState, Mode};
 use wayland_client::Connection;
 
+/// A fast, fuzzy password picker for KeePass databases on Wayland
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Path to KeePass database (overrides config file)
+    #[arg(short, long)]
+    database: Option<PathBuf>,
+}
+
 fn main() {
+    let args = Args::parse();
+
     // 1. Load config and frecency data
     let config = match Config::load() {
         Ok(c) => Rc::new(RefCell::new(c)),
@@ -30,18 +43,31 @@ fn main() {
     };
     let frecency = Rc::new(RefCell::new(FrecencyData::load()));
 
-    // 2. Get database path from config
-    let db_path = match config.borrow().expand_database_path() {
-        Some(p) => p,
-        None => {
-            eprintln!("No database path configured.");
-            eprintln!("Please set database_path in your config file.");
-            if let Ok(path) = Config::data_dir() {
-                eprintln!("Config file: {}/config.toml", path.display());
+    // 2. Get database path from CLI arg or config
+    let db_path = if let Some(p) = args.database {
+        // Expand ~ in CLI argument too
+        let p_str = p.to_string_lossy();
+        if p_str.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&p_str[2..])
+            } else {
+                p
             }
-            eprintln!("\nExample config:");
-            eprintln!("  database_path = \"~/passwords.kdbx\"");
-            std::process::exit(1);
+        } else {
+            p
+        }
+    } else {
+        match config.borrow().expand_database_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("No database path specified.");
+                eprintln!("Use --database or set database_path in config file.");
+                if let Ok(path) = Config::data_dir() {
+                    eprintln!("Config file: {}/config.toml", path.display());
+                }
+                eprintln!("\nExample: kpick --database ~/passwords.kdbx");
+                std::process::exit(1);
+            }
         }
     };
 
