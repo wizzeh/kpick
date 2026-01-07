@@ -6,7 +6,6 @@ mod search;
 mod ui;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use clipboard::copy_with_clear;
@@ -19,12 +18,32 @@ use wayland_client::Connection;
 
 fn main() {
     // 1. Load config and frecency data
-    let config = Rc::new(RefCell::new(Config::load().expect("Failed to load config")));
+    let config = match Config::load() {
+        Ok(c) => Rc::new(RefCell::new(c)),
+        Err(e) => {
+            eprintln!("Failed to load config: {}", e);
+            if let Ok(path) = Config::data_dir() {
+                eprintln!("Config file: {}/config.toml", path.display());
+            }
+            std::process::exit(1);
+        }
+    };
     let frecency = Rc::new(RefCell::new(FrecencyData::load()));
 
-    // 2. Get database path from config, fall back to test.kdbx
-    let db_path = config.borrow().expand_database_path()
-        .unwrap_or_else(|| PathBuf::from("test.kdbx"));
+    // 2. Get database path from config
+    let db_path = match config.borrow().expand_database_path() {
+        Some(p) => p,
+        None => {
+            eprintln!("No database path configured.");
+            eprintln!("Please set database_path in your config file.");
+            if let Ok(path) = Config::data_dir() {
+                eprintln!("Config file: {}/config.toml", path.display());
+            }
+            eprintln!("\nExample config:");
+            eprintln!("  database_path = \"~/passwords.kdbx\"");
+            std::process::exit(1);
+        }
+    };
 
     // Store clipboard timeout before the event loop
     let clipboard_timeout = config.borrow().clipboard_timeout;
@@ -36,8 +55,16 @@ fn main() {
     }
 
     // 3. Set up UI - starts in password mode
-    let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
-    let (mut app_state, mut event_queue) = AppState::new(&conn, &config.borrow(), db_path);
+    let conn = Connection::connect_to_env().unwrap_or_else(|e| {
+        eprintln!("Failed to connect to Wayland display: {}", e);
+        eprintln!("kpick requires a running Wayland compositor.");
+        std::process::exit(1);
+    });
+    let (mut app_state, mut event_queue) = AppState::new(&conn, &config.borrow(), db_path)
+        .unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            std::process::exit(1);
+        });
 
     // Shared state for entries and search
     let entries: Rc<RefCell<Vec<Entry>>> = Rc::new(RefCell::new(Vec::new()));

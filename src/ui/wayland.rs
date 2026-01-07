@@ -42,7 +42,7 @@ use wayland_client::{
 };
 
 /// Attempts to load a font by family name from system directories
-fn load_font_by_family(family: &str) -> Font {
+fn load_font_by_family(family: &str) -> Option<Font> {
     let search_dirs = [
         "/usr/share/fonts",
         "/usr/local/share/fonts",
@@ -57,18 +57,29 @@ fn load_font_by_family(family: &str) -> Font {
     // Search for font matching family name
     for dir in search_dirs.iter().map(PathBuf::from).chain(home_fonts) {
         if let Some(font) = search_font_dir(&dir, &family_lower) {
-            return font;
+            return Some(font);
         }
     }
 
     // Fallback: try to find any TTF
     for dir in search_dirs.iter().map(PathBuf::from) {
         if let Some(font) = find_any_font(&dir) {
-            return font;
+            return Some(font);
         }
     }
 
-    panic!("No fonts found. Please install DejaVu Sans or another TTF font.");
+    None
+}
+
+/// Load a font, returning a user-friendly error if none found
+fn load_font_or_error(family: &str) -> Result<Font, String> {
+    load_font_by_family(family).ok_or_else(|| {
+        format!(
+            "No fonts found. Tried to load '{}' but couldn't find it or any fallback fonts.\n\
+             Please install a TTF font (e.g., DejaVu Sans, Liberation Sans).",
+            family
+        )
+    })
 }
 
 fn search_font_dir(dir: &Path, family_lower: &str) -> Option<Font> {
@@ -189,7 +200,7 @@ pub struct AppState {
 
 impl AppState {
     /// Create a new AppState and its associated event queue
-    pub fn new(conn: &Connection, config: &Config, db_path: PathBuf) -> (Self, EventQueue<Self>) {
+    pub fn new(conn: &Connection, config: &Config, db_path: PathBuf) -> Result<(Self, EventQueue<Self>), String> {
         let (globals, event_queue) = registry_queue_init::<Self>(conn).unwrap();
         let qh = event_queue.handle();
         let registry_state = RegistryState::new(&globals);
@@ -201,7 +212,7 @@ impl AppState {
         let output_state = OutputState::new(&globals, &qh);
 
         // Load our font for text rendering
-        let font = load_font_by_family(&config.font.family);
+        let font = load_font_or_error(&config.font.family)?;
 
         // Convert colors to RGB
         let colors = config.colors.to_rgb();
@@ -260,7 +271,7 @@ impl AppState {
             max_entries: config.window.picker.max_entries,
         };
 
-        (state, event_queue)
+        Ok((state, event_queue))
     }
 
     /// Run the event loop until the user makes a selection or presses escape
@@ -1150,7 +1161,7 @@ fn draw_picker_mode(
 
     // Draw keyboard hints at bottom
     const HINTS_HEIGHT: usize = 20;
-    let hints = "Enter: select | Esc: cancel | Up/Down: navigate";
+    let hints = "Enter: password | Shift+Enter: username | Esc: cancel";
     let hints_y = height - PADDING - HINTS_HEIGHT;
     draw_text_centered(
         font,
