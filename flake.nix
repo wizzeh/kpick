@@ -20,6 +20,25 @@
         };
       in
       {
+        packages.default = pkgs.rustPlatform.buildRustPackage {
+          pname = "kpick";
+          version = "0.1.0";
+          src = ./.;
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = [
+            pkgs.wayland
+            pkgs.libxkbcommon
+          ];
+
+          meta = {
+            description = "KeePassXC password picker for Wayland";
+            license = pkgs.lib.licenses.gpl3Plus;
+            mainProgram = "kpick";
+          };
+        };
+
         devShells.default = pkgs.mkShell {
           buildInputs = [
             rust
