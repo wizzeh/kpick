@@ -25,10 +25,20 @@ struct Args {
     /// Path to KeePass database (overrides config file)
     #[arg(short, long)]
     database: Option<PathBuf>,
+
+    /// Internal: clear clipboard after N seconds (reads expected value from stdin)
+    #[arg(long, hide = true)]
+    internal_clipboard_clear: Option<u64>,
 }
 
 fn main() {
     let args = Args::parse();
+
+    // Handle internal clipboard clear operation (runs in forked child process)
+    if let Some(timeout_secs) = args.internal_clipboard_clear {
+        clipboard::run_clear_daemon(timeout_secs);
+        return;
+    }
 
     // 1. Load config and frecency data
     let config = match Config::load() {

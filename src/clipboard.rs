@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -40,33 +40,59 @@ pub fn copy_with_clear(text: &str, clear_after_secs: u64) -> Result<(), Clipboar
         return Ok(());
     }
 
-    // Spawn thread to clear clipboard after timeout
-    // This avoids shell injection by never using shell escaping
-    let expected = text.to_string();
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(clear_after_secs));
+    // Spawn a child process to clear clipboard after timeout.
+    // We re-exec ourselves with --internal-clipboard-clear because threads die
+    // when the main process exits, but child processes survive.
+    let exe = std::env::current_exe().map_err(ClipboardError::Io)?;
+    let mut clear_child = Command::new(exe)
+        .arg("--internal-clipboard-clear")
+        .arg(clear_after_secs.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(ClipboardError::Io)?;
 
-        // Read current clipboard content
-        let output = Command::new("wl-paste")
-            .arg("-n")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
+    // Pass the expected clipboard content via stdin (avoids shell injection)
+    if let Some(mut stdin) = clear_child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
 
-        if let Ok(output) = output {
-            let current = String::from_utf8_lossy(&output.stdout);
-            // Only clear if clipboard still contains our text
-            if current == expected {
-                let _ = Command::new("wl-copy")
-                    .arg("--clear")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-            }
-        }
-    });
+    // Don't wait - let the child process outlive us
 
     Ok(())
+}
+
+/// Daemon entry point: sleep, check clipboard, clear if unchanged.
+/// Called when invoked with --internal-clipboard-clear.
+pub fn run_clear_daemon(timeout_secs: u64) {
+    // Read expected value from stdin
+    let mut expected = String::new();
+    if std::io::stdin().read_to_string(&mut expected).is_err() {
+        return;
+    }
+
+    // Sleep for the timeout
+    thread::sleep(Duration::from_secs(timeout_secs));
+
+    // Read current clipboard content
+    let output = Command::new("wl-paste")
+        .arg("-n")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    if let Ok(output) = output {
+        let current = String::from_utf8_lossy(&output.stdout);
+        // Only clear if clipboard still contains our text
+        if current == expected {
+            let _ = Command::new("wl-copy")
+                .arg("--clear")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 // Tests require a running Wayland session with wl-clipboard installed
